@@ -3,9 +3,12 @@ use std::{fs, path::Path, time::Duration};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::random;
-use reqwest::header::AUTHORIZATION;
+use reqwest::{
+    header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
+    redirect::Policy,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -16,13 +19,17 @@ use tokio::{
 use url::Url;
 
 use crate::{
-    config::Config,
+    config::{AuthMode, Config},
     error::{AppError, Result},
 };
 
+const API_ROOT: &str = "https://api.beatport.com";
+const DOCS_URL: &str = "https://api.beatport.com/v4/docs/";
 const AUTHORIZATION_URL: &str = "https://api.beatport.com/v4/auth/o/authorize/";
+const LOGIN_URL: &str = "https://api.beatport.com/v4/auth/login/";
 const TOKEN_URL: &str = "https://api.beatport.com/v4/auth/o/token/";
 const REVOKE_URL: &str = "https://api.beatport.com/v4/auth/o/revoke/";
+const USER_AGENT: &str = "beatport-mcp/0.1.0";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const REFRESH_SKEW_SECONDS: i64 = 60;
 
@@ -58,6 +65,7 @@ pub struct DisconnectResult {
 pub struct AuthManager {
     config: Config,
     http: reqwest::Client,
+    resolved_client_id: RwLock<Option<String>>,
     tokens: RwLock<Option<TokenSet>>,
 }
 
@@ -65,6 +73,7 @@ impl AuthManager {
     pub fn new(config: Config, http: reqwest::Client) -> Result<Self> {
         let tokens = load_tokens(&config.token_path)?;
         Ok(Self {
+            resolved_client_id: RwLock::new(config.client_id.clone()),
             config,
             http,
             tokens: RwLock::new(tokens),
@@ -84,6 +93,13 @@ impl AuthManager {
     }
 
     pub async fn connect(&self) -> Result<ConnectResult> {
+        match self.config.auth_mode {
+            AuthMode::OAuthApp => self.connect_with_oauth_app().await,
+            AuthMode::DocsFrontend => self.connect_with_docs_frontend().await,
+        }
+    }
+
+    async fn connect_with_oauth_app(&self) -> Result<ConnectResult> {
         let state = generate_random_urlsafe(32);
         let verifier = generate_random_urlsafe(48);
         let challenge = pkce_challenge(&verifier);
@@ -115,6 +131,20 @@ impl AuthManager {
         })
     }
 
+    async fn connect_with_docs_frontend(&self) -> Result<ConnectResult> {
+        let client_id = self.resolve_client_id().await?;
+        let authorization_url =
+            build_docs_authorization_url(&client_id, &self.config.redirect_uri)?;
+        let token = self.exchange_docs_frontend_credentials(&client_id).await?;
+        self.store_token(Some(token.clone())).await?;
+
+        Ok(ConnectResult {
+            authorization_url: authorization_url.into(),
+            opened_browser: false,
+            token,
+        })
+    }
+
     pub async fn disconnect(&self) -> Result<DisconnectResult> {
         let token = self.snapshot().await;
         let revoked = if let Some(token) = token {
@@ -135,7 +165,7 @@ impl AuthManager {
             .await
             .ok_or(AppError::AuthenticationRequired)?;
         if snapshot.is_expiring_soon() {
-            let refreshed = self.refresh_tokens(&snapshot).await?;
+            let refreshed = self.refresh_or_reconnect(&snapshot).await?;
             return Ok(refreshed.access_token);
         }
         Ok(snapshot.access_token)
@@ -146,7 +176,21 @@ impl AuthManager {
             .snapshot()
             .await
             .ok_or(AppError::AuthenticationRequired)?;
-        self.refresh_tokens(&snapshot).await
+        self.refresh_or_reconnect(&snapshot).await
+    }
+
+    async fn refresh_or_reconnect(&self, current: &TokenSet) -> Result<TokenSet> {
+        match self.refresh_tokens(current).await {
+            Ok(token) => Ok(token),
+            Err(error)
+                if self.config.can_password_bootstrap()
+                    && should_retry_with_docs_frontend_credentials(&error) =>
+            {
+                let result = self.connect_with_docs_frontend().await?;
+                Ok(result.token)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn refresh_tokens(&self, current: &TokenSet) -> Result<TokenSet> {
@@ -154,16 +198,20 @@ impl AuthManager {
             .refresh_token
             .clone()
             .ok_or(AppError::RefreshUnavailable)?;
+        let client_id = self.resolve_client_id().await?;
+        let mut form = vec![
+            ("client_id".to_string(), client_id),
+            ("refresh_token".to_string(), refresh_token),
+            ("grant_type".to_string(), "refresh_token".to_string()),
+        ];
+        if let Some(client_secret) = self.config.client_secret() {
+            form.push(("client_secret".to_string(), client_secret.to_string()));
+        }
         let request = self
             .http
             .post(TOKEN_URL)
             .header(AUTHORIZATION, format!("Bearer {}", current.access_token))
-            .form(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("client_secret", self.config.client_secret.as_str()),
-                ("refresh_token", refresh_token.as_str()),
-                ("grant_type", "refresh_token"),
-            ]);
+            .form(&form);
         let response = request.send().await?;
         let token = parse_token_response(response).await?;
         self.store_token(Some(token.clone())).await?;
@@ -175,30 +223,30 @@ impl AuthManager {
         code: &str,
         code_verifier: &str,
     ) -> Result<TokenSet> {
-        let response = self
-            .http
-            .post(TOKEN_URL)
-            .form(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("client_secret", self.config.client_secret.as_str()),
-                ("code", code),
-                ("grant_type", "authorization_code"),
-                ("redirect_uri", self.config.redirect_uri.as_str()),
-                ("code_verifier", code_verifier),
-            ])
-            .send()
-            .await?;
+        let client_id = self.resolve_client_id().await?;
+        let mut form = vec![
+            ("client_id".to_string(), client_id),
+            (
+                "redirect_uri".to_string(),
+                self.config.redirect_uri.as_str().to_string(),
+            ),
+            ("code".to_string(), code.to_string()),
+            ("grant_type".to_string(), "authorization_code".to_string()),
+            ("code_verifier".to_string(), code_verifier.to_string()),
+        ];
+        if let Some(client_secret) = self.config.client_secret() {
+            form.push(("client_secret".to_string(), client_secret.to_string()));
+        }
+        let response = self.http.post(TOKEN_URL).form(&form).send().await?;
         parse_token_response(response).await
     }
 
     async fn revoke_token(&self, access_token: &str) -> Result<()> {
+        let client_id = self.resolve_client_id().await?;
         let response = self
             .http
             .post(REVOKE_URL)
-            .query(&[
-                ("client_id", self.config.client_id.as_str()),
-                ("token", access_token),
-            ])
+            .query(&[("client_id", client_id.as_str()), ("token", access_token)])
             .send()
             .await?;
         let status = response.status();
@@ -227,6 +275,118 @@ impl AuthManager {
             *guard = None;
         }
         delete_tokens(&self.config.token_path)
+    }
+
+    async fn resolve_client_id(&self) -> Result<String> {
+        if let Some(client_id) = self.resolved_client_id.read().await.clone() {
+            return Ok(client_id);
+        }
+
+        match self.config.auth_mode {
+            AuthMode::OAuthApp => Err(AppError::MissingConfig("BEATPORT_CLIENT_ID")),
+            AuthMode::DocsFrontend => {
+                let client_id = self.fetch_docs_frontend_client_id().await?;
+                let mut guard = self.resolved_client_id.write().await;
+                *guard = Some(client_id.clone());
+                Ok(client_id)
+            }
+        }
+    }
+
+    async fn fetch_docs_frontend_client_id(&self) -> Result<String> {
+        let html = self.http.get(DOCS_URL).send().await?.text().await?;
+        let docs_url = Url::parse(DOCS_URL)?;
+        for script_src in extract_script_sources(&html) {
+            let script_url = docs_url.join(&script_src)?;
+            let script = self.http.get(script_url).send().await?.text().await?;
+            if let Some(client_id) = extract_client_id_from_script(&script) {
+                return Ok(client_id);
+            }
+        }
+
+        Err(AppError::AuthenticationFailed(
+            "could not fetch Beatport docs frontend client id".into(),
+        ))
+    }
+
+    async fn exchange_docs_frontend_credentials(&self, client_id: &str) -> Result<TokenSet> {
+        let username = self
+            .config
+            .username()
+            .ok_or(AppError::MissingConfig("BEATPORT_USERNAME"))?;
+        let password = self
+            .config
+            .password()
+            .ok_or(AppError::MissingConfig("BEATPORT_PASSWORD"))?;
+        let session = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .redirect(Policy::none())
+            .build()?;
+
+        let login_response = session
+            .post(LOGIN_URL)
+            .json(&json!({
+                "username": username,
+                "password": password,
+            }))
+            .send()
+            .await?;
+        let cookie_header = extract_cookie_header(login_response.headers());
+        let login_status = login_response.status();
+        let login_body = login_response.json::<Value>().await?;
+        if !login_status.is_success() {
+            return Err(AppError::beatport_api(login_status, Some(login_body)));
+        }
+        if login_body.get("username").is_none() || login_body.get("email").is_none() {
+            let message = extract_error_message_value(&login_body)
+                .unwrap_or_else(|| "Beatport login did not return an authenticated user".into());
+            return Err(AppError::AuthenticationFailed(message));
+        }
+
+        let authorization_url = build_docs_authorization_url(client_id, &self.config.redirect_uri)?;
+        let mut authorize_request = session.get(authorization_url.clone());
+        if let Some(cookie_header) = cookie_header.as_deref() {
+            authorize_request = authorize_request.header(COOKIE, cookie_header);
+        }
+        let authorize_response = authorize_request.send().await?;
+        let authorize_status = authorize_response.status();
+        let authorize_location = authorize_response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let authorize_body = authorize_response.text().await?;
+
+        let code = match authorize_location {
+            Some(location) => extract_authorization_code(&location)?,
+            None => {
+                let message = extract_html_paragraph(&authorize_body)
+                    .unwrap_or_else(|| authorize_body.trim().to_string());
+                let message = if message.is_empty() {
+                    format!(
+                        "Beatport OAuth redirect missing Location header (status {authorize_status})"
+                    )
+                } else {
+                    message
+                };
+                return Err(AppError::AuthenticationFailed(message));
+            }
+        };
+
+        let mut token_request = session
+            .post(TOKEN_URL)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .query(&[
+                ("code", code.as_str()),
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", self.config.redirect_uri.as_str()),
+                ("client_id", client_id),
+            ]);
+        if let Some(cookie_header) = cookie_header.as_deref() {
+            token_request = token_request.header(COOKIE, cookie_header);
+        }
+        let response = token_request.send().await?;
+        parse_token_response(response).await
     }
 }
 
@@ -257,15 +417,36 @@ async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
 }
 
 fn build_authorization_url(config: &Config, state: &str, code_challenge: &str) -> Result<Url> {
+    let client_id = config
+        .client_id()
+        .ok_or(AppError::MissingConfig("BEATPORT_CLIENT_ID"))?;
+    build_oauth_authorization_url(config, client_id, state, code_challenge)
+}
+
+fn build_oauth_authorization_url(
+    config: &Config,
+    client_id: &str,
+    state: &str,
+    code_challenge: &str,
+) -> Result<Url> {
     let mut url = Url::parse(AUTHORIZATION_URL)?;
     url.query_pairs_mut()
-        .append_pair("client_id", &config.client_id)
+        .append_pair("client_id", client_id)
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", config.redirect_uri.as_str())
         .append_pair("state", state)
         .append_pair("scope", &config.scope)
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256");
+    Ok(url)
+}
+
+fn build_docs_authorization_url(client_id: &str, redirect_uri: &Url) -> Result<Url> {
+    let mut url = Url::parse(AUTHORIZATION_URL)?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri.as_str());
     Ok(url)
 }
 
@@ -385,6 +566,127 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
+fn should_retry_with_docs_frontend_credentials(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::RefreshUnavailable
+            | AppError::AuthenticationRequired
+            | AppError::BeatportApi {
+                status: 400 | 401 | 403,
+                ..
+            }
+    )
+}
+
+fn extract_cookie_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let cookies = headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|cookie| cookie.split(';').next())
+        .map(str::trim)
+        .filter(|cookie| !cookie.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if cookies.is_empty() {
+        None
+    } else {
+        Some(cookies.join("; "))
+    }
+}
+
+fn extract_script_sources(html: &str) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mut remaining = html;
+
+    while let Some(index) = remaining.find("src=") {
+        let after = &remaining[index + 4..];
+        let Some(quote) = after.chars().next() else {
+            break;
+        };
+        if quote != '"' && quote != '\'' {
+            remaining = after;
+            continue;
+        }
+        let after_quote = &after[1..];
+        let Some(end) = after_quote.find(quote) else {
+            break;
+        };
+        let candidate = &after_quote[..end];
+        if candidate.ends_with(".js") {
+            sources.push(candidate.to_string());
+        }
+        remaining = &after_quote[end + 1..];
+    }
+
+    sources
+}
+
+fn extract_client_id_from_script(script: &str) -> Option<String> {
+    let marker = "API_CLIENT_ID";
+    let index = script.find(marker)?;
+    let after = &script[index + marker.len()..];
+    let separator = after.find([':', '='])?;
+    let value = after[separator + 1..].trim_start();
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let end = value[1..].find(quote)?;
+    Some(value[1..1 + end].to_string())
+}
+
+fn extract_authorization_code(location: &str) -> Result<String> {
+    let url = build_v4_url(location)?;
+    let code = url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.to_string())
+        .ok_or_else(|| {
+            AppError::AuthenticationFailed(format!(
+                "Beatport authorization redirect did not include a code: {location}"
+            ))
+        })?;
+    Ok(code)
+}
+
+fn build_v4_url(path_or_url: &str) -> Result<Url> {
+    if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+        return Ok(Url::parse(path_or_url)?);
+    }
+
+    let relative = path_or_url.trim_start_matches('/');
+    let relative = if relative.starts_with("v4/") {
+        relative.to_string()
+    } else {
+        format!("v4/{relative}")
+    };
+    Ok(Url::parse(API_ROOT)?.join(&relative)?)
+}
+
+fn extract_html_paragraph(body: &str) -> Option<String> {
+    let start = body.find("<p>")?;
+    let after = &body[start + 3..];
+    let end = after.find("</p>")?;
+    Some(after[..end].trim().to_string())
+}
+
+fn extract_error_message_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(map) => {
+            for key in ["detail", "error", "message"] {
+                if let Some(message) = map.get(key).and_then(Value::as_str) {
+                    return Some(message.to_string());
+                }
+            }
+            Some(value.to_string())
+        }
+        _ => Some(value.to_string()),
+    }
+}
+
 fn load_tokens(path: &Path) -> Result<Option<TokenSet>> {
     if !path.exists() {
         return Ok(None);
@@ -425,9 +727,13 @@ fn delete_tokens(path: &Path) -> Result<bool> {
 mod tests {
     use chrono::{DateTime, Utc};
     use tempfile::TempDir;
+    use url::Url;
 
-    use super::{TokenSet, build_authorization_url, load_tokens, persist_tokens, pkce_challenge};
-    use crate::config::Config;
+    use super::{
+        TokenSet, build_authorization_url, build_docs_authorization_url,
+        extract_client_id_from_script, load_tokens, persist_tokens, pkce_challenge,
+    };
+    use crate::config::{AuthMode, Config};
     use std::time::SystemTime;
 
     fn test_config(dir: &TempDir) -> Config {
@@ -470,6 +776,37 @@ mod tests {
     }
 
     #[test]
+    fn docs_authorization_url_contains_redirect_uri() {
+        let redirect_uri =
+            Url::parse("https://api.beatport.com/v4/auth/o/post-message/").expect("valid url");
+        let url = build_docs_authorization_url("frontend-client", &redirect_uri)
+            .expect("valid docs authorization url");
+        let query = url.query_pairs().collect::<Vec<_>>();
+
+        assert!(
+            query
+                .iter()
+                .any(|(k, v)| k == "client_id" && v == "frontend-client")
+        );
+        assert!(
+            query
+                .iter()
+                .any(|(k, v)| k == "response_type" && v == "code")
+        );
+        assert!(
+            query.iter().any(|(k, v)| k == "redirect_uri"
+                && v == "https://api.beatport.com/v4/auth/o/post-message/")
+        );
+    }
+
+    #[test]
+    fn extracts_client_id_from_docs_script() {
+        let script = "var config = { API_CLIENT_ID: 'public-client-id' };";
+        let client_id = extract_client_id_from_script(script).expect("client id should be found");
+        assert_eq!(client_id, "public-client-id");
+    }
+
+    #[test]
     fn persists_and_loads_tokens() {
         let dir = TempDir::new().expect("temp dir should be created");
         let config = test_config(&dir);
@@ -487,5 +824,12 @@ mod tests {
             .expect("token should be present");
 
         assert_eq!(loaded, token);
+    }
+
+    #[test]
+    fn auth_test_config_uses_oauth_mode() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let config = test_config(&dir);
+        assert_eq!(config.auth_mode, AuthMode::OAuthApp);
     }
 }

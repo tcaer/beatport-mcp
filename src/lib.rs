@@ -9,6 +9,6 @@ pub use beatport::{
     ApiResponse, BeatportClient, DescribeEndpointOutput, EndpointDescriptionMatch,
     EndpointDescriptionMethod, EndpointDescriptionParameter, SearchResults,
 };
-pub use config::Config;
+pub use config::{AuthMode, Config};
 pub use error::{AppError, Result};
 pub use tools::BeatportMcp;

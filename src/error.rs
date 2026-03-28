@@ -25,6 +25,8 @@ pub enum AppError {
     QuerySerialization(String),
     #[error("beatport authentication required")]
     AuthenticationRequired,
+    #[error("Beatport authentication failed: {0}")]
+    AuthenticationFailed(String),
     #[error("no Beatport refresh token is available; reconnect required")]
     RefreshUnavailable,
     #[error("Beatport OAuth callback timed out")]
@@ -78,6 +80,7 @@ impl From<AppError> for ErrorData {
             | AppError::UnsafePath(message)
             | AppError::QuerySerialization(message)
             | AppError::InvalidCallback(message) => ErrorData::invalid_params(message, None),
+            AppError::AuthenticationFailed(message) => ErrorData::invalid_request(message, None),
             AppError::AuthenticationRequired | AppError::RefreshUnavailable => {
                 ErrorData::invalid_request(
                     "Beatport authentication is required. Run beatport_connect first.",
