@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rand::random;
 use reqwest::{
-    header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
+    header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, LOCATION, SET_COOKIE},
     redirect::Policy,
 };
 use serde::{Deserialize, Serialize};
@@ -247,6 +247,7 @@ impl AuthManager {
             .http
             .post(REVOKE_URL)
             .query(&[("client_id", client_id.as_str()), ("token", access_token)])
+            .header(CONTENT_LENGTH, "0")
             .body("")
             .send()
             .await?;
@@ -332,6 +333,10 @@ impl AuthManager {
             }))
             .send()
             .await?;
+        debug_auth(format_args!(
+            "docs_frontend login status {}",
+            login_response.status()
+        ));
         let cookie_header = extract_cookie_header(login_response.headers());
         let login_status = login_response.status();
         let login_body = login_response.json::<Value>().await?;
@@ -350,6 +355,10 @@ impl AuthManager {
             authorize_request = authorize_request.header(COOKIE, cookie_header);
         }
         let authorize_response = authorize_request.send().await?;
+        debug_auth(format_args!(
+            "docs_frontend authorize status {}",
+            authorize_response.status()
+        ));
         let authorize_status = authorize_response.status();
         let authorize_location = authorize_response
             .headers()
@@ -376,18 +385,22 @@ impl AuthManager {
 
         let mut token_request = session
             .post(TOKEN_URL)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .query(&[
                 ("code", code.as_str()),
                 ("grant_type", "authorization_code"),
                 ("redirect_uri", self.config.redirect_uri.as_str()),
                 ("client_id", client_id),
             ])
+            .header(CONTENT_LENGTH, "0")
             .body("");
         if let Some(cookie_header) = cookie_header.as_deref() {
             token_request = token_request.header(COOKIE, cookie_header);
         }
         let response = token_request.send().await?;
+        debug_auth(format_args!(
+            "docs_frontend token status {}",
+            response.status()
+        ));
         parse_token_response(response).await
     }
 }
@@ -578,6 +591,12 @@ fn should_retry_with_docs_frontend_credentials(error: &AppError) -> bool {
                 ..
             }
     )
+}
+
+fn debug_auth(args: std::fmt::Arguments<'_>) {
+    if std::env::var("BEATPORT_DEBUG_AUTH").ok().as_deref() == Some("1") {
+        eprintln!("beatport-auth-debug: {args}");
+    }
 }
 
 fn extract_cookie_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
