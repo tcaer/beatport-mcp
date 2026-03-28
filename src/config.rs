@@ -59,7 +59,8 @@ impl Config {
         validate_redirect_uri(auth_mode, &redirect_uri)?;
         let scope = lookup("BEATPORT_SCOPE").unwrap_or_else(|| DEFAULT_SCOPE.to_string());
         let token_path = lookup("BEATPORT_TOKEN_PATH")
-            .map(PathBuf::from)
+            .map(resolve_token_path)
+            .transpose()?
             .unwrap_or(default_token_path()?);
 
         Ok(Self {
@@ -237,8 +238,31 @@ fn default_token_path() -> Result<PathBuf> {
     Ok(config_dir.join("beatport-mcp").join("tokens.json"))
 }
 
+fn resolve_token_path(raw: String) -> Result<PathBuf> {
+    match raw.as_str() {
+        "$HOME" | "~" => resolve_home_dir(),
+        _ => {
+            if let Some(stripped) = raw.strip_prefix("$HOME/") {
+                return Ok(resolve_home_dir()?.join(stripped));
+            }
+            if let Some(stripped) = raw.strip_prefix("~/") {
+                return Ok(resolve_home_dir()?.join(stripped));
+            }
+            Ok(PathBuf::from(raw))
+        }
+    }
+}
+
+fn resolve_home_dir() -> Result<PathBuf> {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|_| AppError::InvalidConfig("HOME is not set".into()))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{AuthMode, Config};
 
     #[test]
@@ -307,6 +331,36 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "missing required configuration: BEATPORT_PASSWORD"
+        );
+    }
+
+    #[test]
+    fn expands_home_token_path() {
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", "/tmp/beatport-home");
+        }
+
+        let config = Config::from_lookup(|key| match key {
+            "BEATPORT_USERNAME" => Some("dj@example.com".into()),
+            "BEATPORT_PASSWORD" => Some("secret".into()),
+            "BEATPORT_TOKEN_PATH" => Some("$HOME/.config/beatport-mcp/tokens.json".into()),
+            _ => None,
+        })
+        .expect("config should be valid");
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert_eq!(
+            config.token_path,
+            PathBuf::from("/tmp/beatport-home/.config/beatport-mcp/tokens.json")
         );
     }
 }

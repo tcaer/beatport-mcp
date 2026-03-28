@@ -247,6 +247,7 @@ impl AuthManager {
             .http
             .post(REVOKE_URL)
             .query(&[("client_id", client_id.as_str()), ("token", access_token)])
+            .body("")
             .send()
             .await?;
         let status = response.status();
@@ -381,7 +382,8 @@ impl AuthManager {
                 ("grant_type", "authorization_code"),
                 ("redirect_uri", self.config.redirect_uri.as_str()),
                 ("client_id", client_id),
-            ]);
+            ])
+            .body("");
         if let Some(cookie_header) = cookie_header.as_deref() {
             token_request = token_request.header(COOKIE, cookie_header);
         }
