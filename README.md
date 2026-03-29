@@ -7,6 +7,7 @@ Local Rust MCP server for Beatport v4, built on `rmcp` over `stdio`.
 - OAuth2 authorization-code login with a loopback callback listener
 - Token refresh, token revocation, and on-disk token persistence
 - Curated tools for Beatport search, catalog reads, account reads, playlist writes, and genre subscriptions
+- Higher-level crate sync tools for trending candidates, dry-run playlist diffs, and plan-based apply flows
 - `beatport_describe_endpoint` to inspect the authenticated Beatport OpenAPI schema
 - `beatport_request` as a guarded raw escape hatch for the rest of the API surface
 
@@ -46,6 +47,7 @@ Optional overrides:
 export BEATPORT_REDIRECT_URI="http://127.0.0.1:8765/callback" # oauth_app default
 export BEATPORT_SCOPE="app:external user:dj"
 export BEATPORT_TOKEN_PATH="$HOME/.config/beatport-mcp/tokens.json"
+export BEATPORT_SYNC_STATE_PATH="$HOME/.config/beatport-mcp/sync-state.json"
 ```
 
 For `docs_frontend`, the default redirect URI is:
@@ -61,6 +63,14 @@ cargo run
 ```
 
 The server speaks MCP over `stdio`, so it is intended to be launched by an MCP client.
+
+## Automation-Oriented Tools
+
+- `beatport_trending_candidates`: collect recent chart-driven candidate rows for one or more genres
+- `beatport_playlist_sync_dry_run`: resolve candidate rows, diff them against a playlist, and persist a reviewable sync plan
+- `beatport_playlist_sync_apply`: apply a prior dry-run plan by `plan_id`
+
+Dry-runs persist lightweight state in `sync-state.json` so repeated weekly runs can avoid resurfacing the same tracks as brand-new forever.
 
 ## Auth Notes
 

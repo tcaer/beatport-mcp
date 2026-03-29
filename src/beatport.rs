@@ -1,6 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use reqwest::{Method, StatusCode, header::AUTHORIZATION};
+use reqwest::{
+    Method, StatusCode,
+    header::{AUTHORIZATION, RETRY_AFTER},
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -15,6 +18,9 @@ use crate::{
 
 const API_ROOT: &str = "https://api.beatport.com";
 const SCHEMA_PATH: &str = "/v4/swagger-ui/json/";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_TRANSIENT_RETRIES: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct BeatportClient {
@@ -103,6 +109,8 @@ impl BeatportClient {
     pub fn new(config: Config) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent("beatport-mcp/0.1.0")
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
         let auth = Arc::new(AuthManager::new(config.clone(), http.clone())?);
         Ok(Self {
@@ -115,6 +123,14 @@ impl BeatportClient {
 
     pub fn token_path_string(&self) -> String {
         self.config.token_path_string()
+    }
+
+    pub fn sync_state_path(&self) -> std::path::PathBuf {
+        self.config.sync_state_path.clone()
+    }
+
+    pub fn sync_state_path_string(&self) -> String {
+        self.config.sync_state_path_string()
     }
 
     pub async fn snapshot_token(&self) -> Option<TokenSet> {
@@ -230,34 +246,86 @@ impl BeatportClient {
         allow_retry: bool,
     ) -> Result<ApiResponse> {
         let url = build_api_url(path, query)?;
-        let token = self.auth.access_token().await?;
-        let mut request = self
-            .http
-            .request(method.clone(), url.clone())
-            .header(AUTHORIZATION, format!("Bearer {token}"));
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let response = request.send().await?;
-        let status = response.status();
+        let mut transient_attempt = 0usize;
+        let mut auth_retry_available = allow_retry;
 
-        if status == StatusCode::UNAUTHORIZED && allow_retry {
-            let _ = self.auth.force_refresh().await?;
-            return Box::pin(self.request_inner(method, path, query, body, false)).await;
-        }
+        loop {
+            let token = self.auth.access_token().await?;
+            let mut request = self
+                .http
+                .request(method.clone(), url.clone())
+                .header(AUTHORIZATION, format!("Bearer {token}"));
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error)
+                    if should_retry_transport_error(&error)
+                        && transient_attempt < MAX_TRANSIENT_RETRIES =>
+                {
+                    let delay = retry_delay_for_attempt(transient_attempt, None);
+                    transient_attempt += 1;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let status = response.status();
 
-        let data = parse_response_body(response).await?;
-        if !status.is_success() {
-            return Err(AppError::beatport_api(status, Some(data)));
-        }
+            if status == StatusCode::UNAUTHORIZED && auth_retry_available {
+                let _ = self.auth.force_refresh().await?;
+                auth_retry_available = false;
+                continue;
+            }
 
-        Ok(ApiResponse {
-            method: method.as_str().to_string(),
-            path: path.to_string(),
-            status: status.as_u16(),
-            data,
-        })
+            if should_retry_status(status) && transient_attempt < MAX_TRANSIENT_RETRIES {
+                let delay =
+                    retry_delay_for_attempt(transient_attempt, response.headers().get(RETRY_AFTER));
+                transient_attempt += 1;
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let data = parse_response_body(response).await?;
+            if !status.is_success() {
+                return Err(AppError::beatport_api(status, Some(data)));
+            }
+
+            return Ok(ApiResponse {
+                method: method.as_str().to_string(),
+                path: path.to_string(),
+                status: status.as_u16(),
+                data,
+            });
+        }
     }
+}
+
+fn should_retry_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn retry_delay_for_attempt(
+    attempt: usize,
+    retry_after: Option<&reqwest::header::HeaderValue>,
+) -> Duration {
+    if let Some(delay) = retry_after
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        return Duration::from_secs(delay.min(30));
+    }
+    let seconds = match attempt {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    };
+    Duration::from_secs(seconds)
 }
 
 fn build_api_url(path: &str, query: Option<&BTreeMap<String, Value>>) -> Result<Url> {
@@ -553,10 +621,15 @@ pub fn sanitize_relation(relation: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
+    use reqwest::StatusCode;
     use serde_json::json;
 
-    use super::{merge_paging, sanitize_relation, serialize_query_pairs};
+    use super::{
+        merge_paging, retry_delay_for_attempt, sanitize_relation, serialize_query_pairs,
+        should_retry_status,
+    };
 
     #[test]
     fn serializes_scalar_and_array_queries() {
@@ -595,5 +668,21 @@ mod tests {
     fn relation_must_be_safe() {
         let error = sanitize_relation("../bad").expect_err("unsafe relation should fail");
         assert!(error.to_string().contains("invalid Beatport relation"));
+    }
+
+    #[test]
+    fn retries_transient_status_codes() {
+        assert!(should_retry_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_retry_status(StatusCode::BAD_GATEWAY));
+        assert!(!should_retry_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn respects_retry_after_when_present() {
+        let header = reqwest::header::HeaderValue::from_static("7");
+        assert_eq!(
+            retry_delay_for_attempt(0, Some(&header)),
+            Duration::from_secs(7)
+        );
     }
 }

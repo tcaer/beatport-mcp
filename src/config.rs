@@ -27,6 +27,7 @@ pub struct Config {
     pub redirect_uri: Url,
     pub scope: String,
     pub token_path: PathBuf,
+    pub sync_state_path: PathBuf,
 }
 
 impl Config {
@@ -62,6 +63,10 @@ impl Config {
             .map(resolve_token_path)
             .transpose()?
             .unwrap_or(default_token_path()?);
+        let sync_state_path = lookup("BEATPORT_SYNC_STATE_PATH")
+            .map(resolve_token_path)
+            .transpose()?
+            .unwrap_or_else(|| default_sync_state_path(&token_path));
 
         Ok(Self {
             auth_mode,
@@ -72,6 +77,7 @@ impl Config {
             redirect_uri,
             scope,
             token_path,
+            sync_state_path,
         })
     }
 
@@ -107,6 +113,10 @@ impl Config {
 
     pub fn token_path_string(&self) -> String {
         self.token_path.display().to_string()
+    }
+
+    pub fn sync_state_path_string(&self) -> String {
+        self.sync_state_path.display().to_string()
     }
 
     pub fn client_id(&self) -> Option<&str> {
@@ -236,6 +246,13 @@ fn default_token_path() -> Result<PathBuf> {
         AppError::InvalidConfig("unable to resolve a default config directory".into())
     })?;
     Ok(config_dir.join("beatport-mcp").join("tokens.json"))
+}
+
+fn default_sync_state_path(token_path: &PathBuf) -> PathBuf {
+    token_path
+        .parent()
+        .map(|parent| parent.join("sync-state.json"))
+        .unwrap_or_else(|| PathBuf::from("sync-state.json"))
 }
 
 fn resolve_token_path(raw: String) -> Result<PathBuf> {

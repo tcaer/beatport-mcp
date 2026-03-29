@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod beatport;
 pub mod config;
+pub mod crate_sync;
 pub mod error;
 pub mod tools;
 

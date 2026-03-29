@@ -15,16 +15,23 @@ use crate::beatport::{
     ApiResponse, BeatportClient, DescribeEndpointOutput, SearchResults, merge_paging,
     sanitize_relation,
 };
+use crate::crate_sync::{
+    CrateSyncEngine, PlaylistSyncApplyOutput, PlaylistSyncApplyRequest, PlaylistSyncDryRunOutput,
+    PlaylistSyncDryRunRequest, TrendingCandidatesOutput, TrendingCandidatesRequest,
+};
 
 pub struct BeatportMcp {
     client: BeatportClient,
+    sync_engine: CrateSyncEngine,
     tool_router: ToolRouter<Self>,
 }
 
 impl BeatportMcp {
     pub fn new(client: BeatportClient) -> Self {
+        let sync_engine = CrateSyncEngine::new(client.clone(), client.sync_state_path());
         Self {
             client,
+            sync_engine,
             tool_router: Self::tool_router(),
         }
     }
@@ -39,7 +46,7 @@ impl ServerHandler for BeatportMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Authenticate with beatport_connect, then use curated Beatport tools or beatport_request for long-tail endpoints.",
+                "Authenticate with beatport_connect, then prefer the curated Beatport sync tools for automation and playlist curation. Use beatport_request only for long-tail endpoints.",
             )
     }
 }
@@ -385,6 +392,54 @@ impl BeatportMcp {
             status: response.status,
             data,
         }))
+    }
+
+    #[tool(
+        name = "beatport_trending_candidates",
+        description = "Collect recent Beatport chart candidates for one or more genres as normalized sync rows."
+    )]
+    async fn beatport_trending_candidates(
+        &self,
+        Parameters(request): Parameters<TrendingCandidatesRequest>,
+    ) -> std::result::Result<Json<TrendingCandidatesOutput>, ErrorData> {
+        let output = self
+            .sync_engine
+            .trending_candidates(request)
+            .await
+            .map_err(Self::tool_error)?;
+        Ok(Json(output))
+    }
+
+    #[tool(
+        name = "beatport_playlist_sync_dry_run",
+        description = "Resolve candidate rows against Beatport, diff them against a playlist and prior seen state, and persist a reviewable sync plan."
+    )]
+    async fn beatport_playlist_sync_dry_run(
+        &self,
+        Parameters(request): Parameters<PlaylistSyncDryRunRequest>,
+    ) -> std::result::Result<Json<PlaylistSyncDryRunOutput>, ErrorData> {
+        let output = self
+            .sync_engine
+            .playlist_sync_dry_run(request)
+            .await
+            .map_err(Self::tool_error)?;
+        Ok(Json(output))
+    }
+
+    #[tool(
+        name = "beatport_playlist_sync_apply",
+        description = "Apply a previously persisted playlist sync dry-run plan by plan_id."
+    )]
+    async fn beatport_playlist_sync_apply(
+        &self,
+        Parameters(request): Parameters<PlaylistSyncApplyRequest>,
+    ) -> std::result::Result<Json<PlaylistSyncApplyOutput>, ErrorData> {
+        let output = self
+            .sync_engine
+            .playlist_sync_apply(request)
+            .await
+            .map_err(Self::tool_error)?;
+        Ok(Json(output))
     }
 
     #[tool(
