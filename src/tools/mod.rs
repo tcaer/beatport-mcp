@@ -11,13 +11,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::AuthMode;
 use crate::beatport::{
-    ApiResponse, BeatportClient, DescribeEndpointOutput, SearchResults, merge_paging,
-    sanitize_relation,
+    ApiResponse, BeatportClient, CompactTrackSummary, DescribeEndpointOutput, SearchResults,
+    extract_compact_track_summaries, merge_paging, sanitize_relation,
 };
 use crate::crate_sync::{
     CrateSyncEngine, PlaylistSyncApplyOutput, PlaylistSyncApplyRequest, PlaylistSyncDryRunOutput,
-    PlaylistSyncDryRunRequest, TrendingCandidatesOutput, TrendingCandidatesRequest,
+    PlaylistSyncDryRunRequest, PlaylistSyncResolveOutput, PlaylistSyncResolveRequest,
+    PlaylistSyncReviewOutput, PlaylistSyncReviewRequest, TrendingCandidatesOutput,
+    TrendingCandidatesRequest,
 };
 
 pub struct BeatportMcp {
@@ -81,6 +84,45 @@ pub struct SearchOutput {
     pub path: String,
     pub status: u16,
     pub data: SearchResults,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompactSearchRequest {
+    pub query: String,
+    pub per_page: Option<u64>,
+    pub include_tracks_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompactSearchOutput {
+    pub path: String,
+    pub status: u16,
+    pub candidates: Vec<CompactTrackSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlaylistTracksCompactRequest {
+    pub playlist_id: u64,
+    pub page: Option<u64>,
+    pub per_page: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlaylistTracksCompactOutput {
+    pub path: String,
+    pub status: u16,
+    pub playlist_id: u64,
+    pub tracks: Vec<CompactTrackSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ServerInfoOutput {
+    pub server_version: String,
+    pub auth_mode: String,
+    pub token_path: String,
+    pub sync_state_path: String,
+    pub curated_tools: Vec<String>,
+    pub requires_reconnect_after_tool_changes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -395,6 +437,38 @@ impl BeatportMcp {
     }
 
     #[tool(
+        name = "beatport_search_compact",
+        description = "Search Beatport tracks and return compact typed summaries that are easier to diff and review."
+    )]
+    async fn beatport_search_compact(
+        &self,
+        Parameters(request): Parameters<CompactSearchRequest>,
+    ) -> std::result::Result<Json<CompactSearchOutput>, ErrorData> {
+        let mut query = merge_paging(None, Some(1), request.per_page);
+        query.insert("q".into(), json!(request.query));
+        if request.include_tracks_only.unwrap_or(true) {
+            query.insert("type".into(), json!("tracks"));
+        }
+        let response = self
+            .client
+            .request(Method::GET, "/v4/catalog/search/", Some(&query), None)
+            .await
+            .map_err(Self::tool_error)?;
+        let candidates = response
+            .data
+            .get("tracks")
+            .map(extract_compact_track_summaries)
+            .transpose()
+            .map_err(Self::tool_error)?
+            .unwrap_or_default();
+        Ok(Json(CompactSearchOutput {
+            path: response.path,
+            status: response.status,
+            candidates,
+        }))
+    }
+
+    #[tool(
         name = "beatport_trending_candidates",
         description = "Collect recent Beatport chart candidates for one or more genres as normalized sync rows."
     )]
@@ -440,6 +514,89 @@ impl BeatportMcp {
             .await
             .map_err(Self::tool_error)?;
         Ok(Json(output))
+    }
+
+    #[tool(
+        name = "beatport_playlist_sync_review",
+        description = "Load the remaining compact review items for a previously persisted sync plan."
+    )]
+    async fn beatport_playlist_sync_review(
+        &self,
+        Parameters(request): Parameters<PlaylistSyncReviewRequest>,
+    ) -> std::result::Result<Json<PlaylistSyncReviewOutput>, ErrorData> {
+        let output = self
+            .sync_engine
+            .playlist_sync_review(request)
+            .await
+            .map_err(Self::tool_error)?;
+        Ok(Json(output))
+    }
+
+    #[tool(
+        name = "beatport_playlist_sync_resolve",
+        description = "Resolve ambiguous or not-found sync review items by choosing a track id or skipping them before apply."
+    )]
+    async fn beatport_playlist_sync_resolve(
+        &self,
+        Parameters(request): Parameters<PlaylistSyncResolveRequest>,
+    ) -> std::result::Result<Json<PlaylistSyncResolveOutput>, ErrorData> {
+        let output = self
+            .sync_engine
+            .playlist_sync_resolve(request)
+            .await
+            .map_err(Self::tool_error)?;
+        Ok(Json(output))
+    }
+
+    #[tool(
+        name = "beatport_playlist_tracks_compact",
+        description = "List compact typed track summaries for a Beatport playlist page."
+    )]
+    async fn beatport_playlist_tracks_compact(
+        &self,
+        Parameters(request): Parameters<PlaylistTracksCompactRequest>,
+    ) -> std::result::Result<Json<PlaylistTracksCompactOutput>, ErrorData> {
+        let path = format!("/v4/my/playlists/{}/tracks/", request.playlist_id);
+        let filters = merge_paging(None, request.page.or(Some(1)), request.per_page);
+        let response = self
+            .client
+            .request(Method::GET, &path, Some(&filters), None)
+            .await
+            .map_err(Self::tool_error)?;
+        let tracks = extract_compact_track_summaries(&response.data).map_err(Self::tool_error)?;
+        Ok(Json(PlaylistTracksCompactOutput {
+            path: response.path,
+            status: response.status,
+            playlist_id: request.playlist_id,
+            tracks,
+        }))
+    }
+
+    #[tool(
+        name = "beatport_server_info",
+        description = "Return Beatport MCP version, auth mode, sync state path, and the curated tool set expected after reconnect."
+    )]
+    async fn beatport_server_info(&self) -> std::result::Result<Json<ServerInfoOutput>, ErrorData> {
+        let auth_mode = match self.client.auth_mode() {
+            AuthMode::OAuthApp => "oauth_app",
+            AuthMode::DocsFrontend => "docs_frontend",
+        };
+        Ok(Json(ServerInfoOutput {
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            auth_mode: auth_mode.to_string(),
+            token_path: self.client.token_path_string(),
+            sync_state_path: self.client.sync_state_path_string(),
+            curated_tools: vec![
+                "beatport_search_compact".into(),
+                "beatport_playlist_tracks_compact".into(),
+                "beatport_trending_candidates".into(),
+                "beatport_playlist_sync_dry_run".into(),
+                "beatport_playlist_sync_review".into(),
+                "beatport_playlist_sync_resolve".into(),
+                "beatport_playlist_sync_apply".into(),
+            ],
+            requires_reconnect_after_tool_changes: true,
+        }))
     }
 
     #[tool(

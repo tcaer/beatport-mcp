@@ -28,6 +28,7 @@ pub struct Config {
     pub scope: String,
     pub token_path: PathBuf,
     pub sync_state_path: PathBuf,
+    pub sync_search_concurrency: usize,
 }
 
 impl Config {
@@ -67,6 +68,10 @@ impl Config {
             .map(resolve_token_path)
             .transpose()?
             .unwrap_or_else(|| default_sync_state_path(&token_path));
+        let sync_search_concurrency = lookup("BEATPORT_SYNC_SEARCH_CONCURRENCY")
+            .map(|value| parse_positive_usize("BEATPORT_SYNC_SEARCH_CONCURRENCY", &value))
+            .transpose()?
+            .unwrap_or(6);
 
         Ok(Self {
             auth_mode,
@@ -78,6 +83,7 @@ impl Config {
             scope,
             token_path,
             sync_state_path,
+            sync_search_concurrency,
         })
     }
 
@@ -203,6 +209,18 @@ fn validate_redirect_uri(auth_mode: AuthMode, uri: &Url) -> Result<()> {
         AuthMode::OAuthApp => validate_loopback_redirect_uri(uri),
         AuthMode::DocsFrontend => validate_docs_redirect_uri(uri),
     }
+}
+
+fn parse_positive_usize(key: &'static str, value: &str) -> Result<usize> {
+    let parsed = value.parse::<usize>().map_err(|_| {
+        AppError::InvalidConfig(format!("{key} must be a positive integer, got `{value}`"))
+    })?;
+    if parsed == 0 {
+        return Err(AppError::InvalidConfig(format!(
+            "{key} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn validate_loopback_redirect_uri(uri: &Url) -> Result<()> {

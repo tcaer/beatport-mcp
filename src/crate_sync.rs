@@ -18,7 +18,7 @@ use tokio::{
 
 use crate::{
     AppError, BeatportClient, Result,
-    beatport::{ApiResponse, merge_paging},
+    beatport::{ApiResponse, CompactTrackSummary, merge_paging},
 };
 
 const DEFAULT_LOOKBACK_DAYS: u64 = 7;
@@ -27,7 +27,8 @@ const DEFAULT_CHARTS_PER_GENRE: u64 = 6;
 const SEARCH_PER_PAGE: u64 = 8;
 const PLAYLIST_PAGE_SIZE: u64 = 100;
 const APPLY_CHUNK_SIZE: usize = 100;
-const SEARCH_CONCURRENCY: usize = 6;
+const DEFAULT_SEARCH_CONCURRENCY: usize = 6;
+const DUPLICATE_LENGTH_WINDOW_MS: u64 = 4_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SyncCandidate {
@@ -36,39 +37,49 @@ pub struct SyncCandidate {
     pub mix: Option<String>,
     pub genre: Option<String>,
     pub source: String,
+    pub source_type: Option<String>,
+    pub source_name: Option<String>,
     pub source_url: Option<String>,
+    pub discovered_at: Option<String>,
     pub beatport_track_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateBasisKind {
+    ExactTrackId,
+    Isrc,
+    LabelTrackIdentifier,
+    NormalizedArtistTitleMix,
+    NormalizedArtistTitleHeuristic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SyncTrackSummary {
-    pub id: u64,
-    pub artist: String,
-    pub track: String,
-    pub mix: Option<String>,
-    pub genre: Option<String>,
-    pub url: Option<String>,
-    pub publish_date: Option<String>,
+pub struct SyncDuplicateBasis {
+    pub kind: DuplicateBasisKind,
+    pub matched_track_id: Option<u64>,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SyncResolvedCandidate {
     pub candidate: SyncCandidate,
-    pub matched_track: SyncTrackSummary,
+    pub matched_track: CompactTrackSummary,
     pub confidence_score: f64,
+    pub duplicate_basis: Option<SyncDuplicateBasis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SyncAmbiguousCandidate {
     pub candidate: SyncCandidate,
-    pub matches: Vec<SyncTrackSummary>,
+    pub matches: Vec<CompactTrackSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SyncNotFoundCandidate {
     pub candidate: SyncCandidate,
     pub reason: String,
-    pub best_match: Option<SyncTrackSummary>,
+    pub best_match: Option<CompactTrackSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -76,12 +87,18 @@ pub struct SyncFailure {
     pub source: Option<String>,
     pub candidate: Option<SyncCandidate>,
     pub message: String,
+    pub path: Option<String>,
+    pub status_code: Option<u16>,
+    pub retryable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SyncApplyFailure {
     pub track_ids: Vec<u64>,
     pub message: String,
+    pub path: Option<String>,
+    pub status_code: Option<u16>,
+    pub retryable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
@@ -135,6 +152,7 @@ pub struct TrendingCandidatesRequest {
     pub source_profile: Option<TrendingSourceProfile>,
     pub lookback_days: Option<u64>,
     pub max_candidates: Option<u64>,
+    pub dedupe_across_genres: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -143,6 +161,7 @@ pub struct TrendingCandidatesOutput {
     pub lookback_days: u64,
     pub genres: Vec<String>,
     pub max_candidates: u64,
+    pub dedupe_across_genres: bool,
     pub candidates: Vec<SyncCandidate>,
     pub failures: Vec<SyncFailure>,
 }
@@ -156,17 +175,83 @@ pub struct PlaylistSyncDryRunRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlaylistSyncDryRunSummary {
+    pub addable: usize,
+    pub already_present: usize,
+    pub already_seen: usize,
+    pub ambiguous: usize,
+    pub not_found: usize,
+    pub failures: usize,
+    pub remaining_review: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    Ambiguous,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SyncReviewItem {
+    pub review_index: usize,
+    pub candidate: SyncCandidate,
+    pub status: ReviewStatus,
+    pub options: Vec<CompactTrackSummary>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PlaylistSyncDryRunOutput {
     pub plan_id: String,
     pub playlist_id: u64,
     pub matching_policy: SyncMatchingPolicy,
     pub dedupe_policy: SyncDedupePolicy,
+    pub summary: PlaylistSyncDryRunSummary,
     pub addable: Vec<SyncResolvedCandidate>,
     pub already_present: Vec<SyncResolvedCandidate>,
     pub already_seen: Vec<SyncResolvedCandidate>,
     pub ambiguous: Vec<SyncAmbiguousCandidate>,
     pub not_found: Vec<SyncNotFoundCandidate>,
+    pub review_items: Vec<SyncReviewItem>,
     pub failures: Vec<SyncFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlaylistSyncReviewRequest {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlaylistSyncReviewOutput {
+    pub plan_id: String,
+    pub playlist_id: u64,
+    pub summary: PlaylistSyncDryRunSummary,
+    pub review_items: Vec<SyncReviewItem>,
+    pub already_applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SyncResolutionDecision {
+    pub review_index: usize,
+    pub chosen_track_id: Option<u64>,
+    pub skip: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlaylistSyncResolveRequest {
+    pub plan_id: String,
+    pub decisions: Vec<SyncResolutionDecision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlaylistSyncResolveOutput {
+    pub plan_id: String,
+    pub playlist_id: u64,
+    pub summary: PlaylistSyncDryRunSummary,
+    pub resolved_to_addable: Vec<SyncResolvedCandidate>,
+    pub skipped_review_indices: Vec<usize>,
+    pub remaining_review_items: Vec<SyncReviewItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -178,10 +263,12 @@ pub struct PlaylistSyncApplyRequest {
 pub struct PlaylistSyncApplyOutput {
     pub plan_id: String,
     pub playlist_id: u64,
-    pub added_track_ids: Vec<u64>,
-    pub skipped_track_ids: Vec<u64>,
-    pub failures: Vec<SyncApplyFailure>,
+    pub added: Vec<CompactTrackSummary>,
+    pub skipped_already_present: Vec<CompactTrackSummary>,
+    pub skipped_seen: Vec<CompactTrackSummary>,
+    pub failed: Vec<SyncApplyFailure>,
     pub applied_at: String,
+    pub already_applied: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -194,9 +281,11 @@ pub struct CrateSyncEngine {
 impl CrateSyncEngine {
     pub fn new(client: BeatportClient, state_path: PathBuf) -> Self {
         Self {
+            search_limit: client
+                .sync_search_concurrency()
+                .max(DEFAULT_SEARCH_CONCURRENCY.min(client.sync_search_concurrency())),
             client,
             store: SyncStateStore::new(state_path),
-            search_limit: SEARCH_CONCURRENCY,
         }
     }
 
@@ -215,6 +304,7 @@ impl CrateSyncEngine {
             .max_candidates
             .unwrap_or(DEFAULT_MAX_CANDIDATES)
             .max(1);
+        let dedupe_across_genres = request.dedupe_across_genres.unwrap_or(true);
         let cutoff = Utc::now() - Duration::days(lookback_days as i64);
         let cutoff_date = cutoff.date_naive();
         let genres = self.resolve_genres(&request.genres).await?;
@@ -234,11 +324,12 @@ impl CrateSyncEngine {
                     {
                         Ok(charts) => charts,
                         Err(error) => {
-                            failures.push(SyncFailure {
-                                source: Some(genre_source_key(&genre)),
-                                candidate: None,
-                                message: error.to_string(),
-                            });
+                            failures.push(sync_failure_from_error(
+                                Some(genre_source_key(&genre)),
+                                None,
+                                error,
+                                Some("/v4/catalog/charts/".into()),
+                            ));
                             continue;
                         }
                     };
@@ -248,11 +339,12 @@ impl CrateSyncEngine {
                         let tracks = match self.fetch_chart_tracks(chart.id).await {
                             Ok(tracks) => tracks,
                             Err(error) => {
-                                failures.push(SyncFailure {
-                                    source: Some(genre_source_key(&genre)),
-                                    candidate: None,
-                                    message: format!("failed to load chart {}: {error}", chart.id),
-                                });
+                                failures.push(sync_failure_from_error(
+                                    Some(genre_source_key(&genre)),
+                                    None,
+                                    error,
+                                    Some(format!("/v4/catalog/charts/{}/tracks/", chart.id)),
+                                ));
                                 continue;
                             }
                         };
@@ -266,7 +358,7 @@ impl CrateSyncEngine {
                             if !track_is_recent(&track, cutoff_date) {
                                 continue;
                             }
-                            if !seen_track_ids.insert(track.id) {
+                            if dedupe_across_genres && !seen_track_ids.insert(track.id) {
                                 continue;
                             }
                             candidates.push(candidate_from_chart_track(&genre, &chart, &track));
@@ -288,6 +380,7 @@ impl CrateSyncEngine {
             lookback_days,
             genres: request.genres,
             max_candidates,
+            dedupe_across_genres,
             candidates,
             failures,
         })
@@ -311,7 +404,8 @@ impl CrateSyncEngine {
                 .map(normalize_candidate)
                 .collect::<Result<Vec<_>>>()?,
         );
-        let playlist_track_ids = self.fetch_playlist_track_ids(request.playlist_id).await?;
+        let playlist_tracks = self.fetch_playlist_tracks(request.playlist_id).await?;
+        let playlist_index = PlaylistIdentityIndex::from_tracks(&playlist_tracks);
         let seen_state = self.store.snapshot().await?;
 
         let resolutions = self.resolve_candidates(candidates, matching_policy).await;
@@ -325,21 +419,28 @@ impl CrateSyncEngine {
 
         for resolution in resolutions {
             match resolution {
-                CandidateResolution::Matched(item) => {
+                CandidateResolution::Matched(mut item) => {
                     let seen_key = seen_bucket_key(request.playlist_id, &item.candidate.source);
-                    if playlist_track_ids.contains(&item.matched_track.id) {
-                        seen_updates.push((seen_key, item.matched_track.id));
+                    let identity = recording_identity(&item.matched_track);
+                    if let Some(basis) = playlist_index.duplicate_basis_for(&item.matched_track) {
+                        item.duplicate_basis = Some(basis.clone());
+                        seen_updates.push((seen_key, identity.storage_keys()));
                         already_present.push(item);
-                    } else if dedupe_policy.uses_seen()
-                        && seen_state
-                            .seen
-                            .get(&seen_key)
-                            .is_some_and(|tracks| tracks.contains(&item.matched_track.id))
-                    {
-                        seen_updates.push((seen_key, item.matched_track.id));
-                        already_seen.push(item);
+                    } else if dedupe_policy.uses_seen() {
+                        if let Some(basis) = duplicate_basis_from_seen(
+                            seen_state.seen.get(&seen_key),
+                            &identity,
+                            item.matched_track.track_id,
+                        ) {
+                            item.duplicate_basis = Some(basis.clone());
+                            seen_updates.push((seen_key, identity.storage_keys()));
+                            already_seen.push(item);
+                        } else {
+                            seen_updates.push((seen_key, identity.storage_keys()));
+                            addable.push(item);
+                        }
                     } else {
-                        seen_updates.push((seen_key, item.matched_track.id));
+                        seen_updates.push((seen_key, identity.storage_keys()));
                         addable.push(item);
                     }
                 }
@@ -350,16 +451,28 @@ impl CrateSyncEngine {
         }
 
         let plan_id = new_plan_id();
+        let review_items = build_review_items(&ambiguous, &not_found);
+        let summary = build_summary(
+            addable.len(),
+            already_present.len(),
+            already_seen.len(),
+            ambiguous.len(),
+            not_found.len(),
+            failures.len(),
+            review_items.len(),
+        );
         let output = PlaylistSyncDryRunOutput {
             plan_id: plan_id.clone(),
             playlist_id: request.playlist_id,
             matching_policy,
             dedupe_policy,
+            summary,
             addable,
             already_present,
             already_seen,
             ambiguous,
             not_found,
+            review_items,
             failures,
         };
         self.store
@@ -376,10 +489,10 @@ impl CrateSyncEngine {
         Ok(output)
     }
 
-    pub async fn playlist_sync_apply(
+    pub async fn playlist_sync_review(
         &self,
-        request: PlaylistSyncApplyRequest,
-    ) -> Result<PlaylistSyncApplyOutput> {
+        request: PlaylistSyncReviewRequest,
+    ) -> Result<PlaylistSyncReviewOutput> {
         let plan = self
             .store
             .load_plan(&request.plan_id)
@@ -387,35 +500,170 @@ impl CrateSyncEngine {
             .ok_or_else(|| {
                 AppError::InvalidConfig(format!("unknown plan_id `{}`", request.plan_id))
             })?;
-        let current_track_ids = self.fetch_playlist_track_ids(plan.playlist_id).await?;
+        Ok(PlaylistSyncReviewOutput {
+            plan_id: plan.plan_id.clone(),
+            playlist_id: plan.playlist_id,
+            summary: plan.summary(),
+            review_items: plan.pending_review_items(),
+            already_applied: plan.last_apply.is_some(),
+        })
+    }
+
+    pub async fn playlist_sync_resolve(
+        &self,
+        request: PlaylistSyncResolveRequest,
+    ) -> Result<PlaylistSyncResolveOutput> {
+        if request.decisions.is_empty() {
+            return Err(AppError::InvalidConfig(
+                "decisions must contain at least one resolution".into(),
+            ));
+        }
+        let mut plan = self
+            .store
+            .load_plan(&request.plan_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::InvalidConfig(format!("unknown plan_id `{}`", request.plan_id))
+            })?;
+        if plan.last_apply.is_some() {
+            return Err(AppError::InvalidConfig(
+                "cannot resolve a plan after it has already been applied".into(),
+            ));
+        }
+
+        let mut resolved_to_addable = Vec::new();
+        let mut skipped_review_indices = Vec::new();
+        for decision in request.decisions {
+            let Some(review_item) = plan
+                .review_items
+                .iter_mut()
+                .find(|item| item.review.review_index == decision.review_index)
+            else {
+                return Err(AppError::InvalidConfig(format!(
+                    "unknown review_index `{}` for plan `{}`",
+                    decision.review_index, plan.plan_id
+                )));
+            };
+            if review_item.resolved {
+                continue;
+            }
+            if decision.skip.unwrap_or(false) {
+                review_item.resolved = true;
+                review_item.skipped = true;
+                skipped_review_indices.push(review_item.review.review_index);
+                continue;
+            }
+            let chosen_track_id = decision.chosen_track_id.ok_or_else(|| {
+                AppError::InvalidConfig(format!(
+                    "review_index `{}` requires chosen_track_id or skip=true",
+                    decision.review_index
+                ))
+            })?;
+            let matched_track = review_item
+                .review
+                .options
+                .iter()
+                .find(|option| option.track_id == chosen_track_id)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::InvalidConfig(format!(
+                        "chosen_track_id `{chosen_track_id}` is not a valid option for review_index `{}`",
+                        decision.review_index
+                    ))
+                })?;
+            let resolved = SyncResolvedCandidate {
+                candidate: review_item.review.candidate.clone(),
+                matched_track,
+                confidence_score: 100.0,
+                duplicate_basis: None,
+            };
+            review_item.resolved = true;
+            review_item.skipped = false;
+            resolved_to_addable.push(resolved.clone());
+            plan.addable.push(resolved);
+        }
+
+        self.store.save_plan(plan.clone()).await?;
+        Ok(PlaylistSyncResolveOutput {
+            plan_id: plan.plan_id.clone(),
+            playlist_id: plan.playlist_id,
+            summary: plan.summary(),
+            resolved_to_addable,
+            skipped_review_indices,
+            remaining_review_items: plan.pending_review_items(),
+        })
+    }
+
+    pub async fn playlist_sync_apply(
+        &self,
+        request: PlaylistSyncApplyRequest,
+    ) -> Result<PlaylistSyncApplyOutput> {
+        let mut plan = self
+            .store
+            .load_plan(&request.plan_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::InvalidConfig(format!("unknown plan_id `{}`", request.plan_id))
+            })?;
+        if let Some(last_apply) = plan.last_apply.clone() {
+            return Ok(PlaylistSyncApplyOutput {
+                plan_id: plan.plan_id.clone(),
+                playlist_id: plan.playlist_id,
+                added: last_apply.added,
+                skipped_already_present: last_apply.skipped_already_present,
+                skipped_seen: last_apply.skipped_seen,
+                failed: last_apply.failed,
+                applied_at: last_apply.applied_at,
+                already_applied: true,
+            });
+        }
+
+        let playlist_tracks = self.fetch_playlist_tracks(plan.playlist_id).await?;
+        let playlist_index = PlaylistIdentityIndex::from_tracks(&playlist_tracks);
+        let seen_state = self.store.snapshot().await?;
 
         let mut to_add = Vec::new();
-        let mut skipped = Vec::new();
+        let mut skipped_already_present = Vec::new();
+        let mut skipped_seen = Vec::new();
+        let mut seen_updates = Vec::new();
+
         for item in &plan.addable {
-            let track_id = item.matched_track.id;
-            if current_track_ids.contains(&track_id) {
-                skipped.push(track_id);
-            } else {
-                to_add.push(track_id);
+            let seen_key = seen_bucket_key(plan.playlist_id, &item.candidate.source);
+            let identity = recording_identity(&item.matched_track);
+            if playlist_index
+                .duplicate_basis_for(&item.matched_track)
+                .is_some()
+            {
+                skipped_already_present.push(item.matched_track.clone());
+                seen_updates.push((seen_key, identity.storage_keys()));
+                continue;
             }
+            if plan.dedupe_policy.uses_seen()
+                && duplicate_basis_from_seen(
+                    seen_state.seen.get(&seen_key),
+                    &identity,
+                    item.matched_track.track_id,
+                )
+                .is_some()
+            {
+                skipped_seen.push(item.matched_track.clone());
+                seen_updates.push((seen_key, identity.storage_keys()));
+                continue;
+            }
+            to_add.push(item.matched_track.clone());
+            seen_updates.push((seen_key, identity.storage_keys()));
         }
 
         let mut added = Vec::new();
-        let mut failures = Vec::new();
+        let mut failed = Vec::new();
         for chunk in to_add.chunks(APPLY_CHUNK_SIZE) {
             if chunk.is_empty() {
                 continue;
             }
-            let chunk_vec = chunk.to_vec();
-            match self
-                .add_tracks_to_playlist(plan.playlist_id, &chunk_vec)
-                .await
-            {
-                Ok(()) => added.extend(chunk_vec),
-                Err(error) => failures.push(SyncApplyFailure {
-                    track_ids: chunk_vec,
-                    message: error.to_string(),
-                }),
+            let ids = chunk.iter().map(|track| track.track_id).collect::<Vec<_>>();
+            match self.add_tracks_to_playlist(plan.playlist_id, &ids).await {
+                Ok(()) => added.extend_from_slice(chunk),
+                Err(error) => failed.push(apply_failure_from_error(ids, error)),
             }
         }
 
@@ -423,14 +671,22 @@ impl CrateSyncEngine {
         let output = PlaylistSyncApplyOutput {
             plan_id: plan.plan_id.clone(),
             playlist_id: plan.playlist_id,
-            added_track_ids: added,
-            skipped_track_ids: skipped,
-            failures,
+            added: added.clone(),
+            skipped_already_present: skipped_already_present.clone(),
+            skipped_seen: skipped_seen.clone(),
+            failed: failed.clone(),
             applied_at: applied_at.clone(),
+            already_applied: false,
         };
-        self.store
-            .record_apply(&plan.plan_id, &output, applied_at)
-            .await?;
+        plan.last_apply = Some(StoredApplySummary {
+            applied_at: applied_at.clone(),
+            added,
+            skipped_already_present,
+            skipped_seen,
+            failed,
+        });
+        self.store.record_seen_updates(seen_updates).await?;
+        self.store.save_plan(plan).await?;
         Ok(output)
     }
 
@@ -508,10 +764,10 @@ impl CrateSyncEngine {
         Ok(response.results)
     }
 
-    async fn fetch_playlist_track_ids(&self, playlist_id: u64) -> Result<BTreeSet<u64>> {
+    async fn fetch_playlist_tracks(&self, playlist_id: u64) -> Result<Vec<CompactTrackSummary>> {
         let path = format!("/v4/my/playlists/{playlist_id}/tracks/");
         let mut page = 1;
-        let mut track_ids = BTreeSet::new();
+        let mut tracks = Vec::new();
 
         loop {
             let response: PaginatedResponse<ApiPlaylistTrackEntry> = self
@@ -525,7 +781,10 @@ impl CrateSyncEngine {
 
             for entry in response.results {
                 if !entry.tombstoned.unwrap_or(false) {
-                    track_ids.insert(entry.track.id);
+                    tracks.push(compact_track_summary_from_api_track(
+                        &entry.track,
+                        Some(entry.id),
+                    ));
                 }
             }
 
@@ -535,7 +794,7 @@ impl CrateSyncEngine {
             page += 1;
         }
 
-        Ok(track_ids)
+        Ok(tracks)
     }
 
     async fn add_tracks_to_playlist(&self, playlist_id: u64, track_ids: &[u64]) -> Result<()> {
@@ -565,7 +824,7 @@ impl CrateSyncEngine {
         candidates: Vec<SyncCandidate>,
         matching_policy: SyncMatchingPolicy,
     ) -> Vec<CandidateResolution> {
-        let semaphore = Arc::new(Semaphore::new(self.search_limit));
+        let semaphore = Arc::new(Semaphore::new(self.search_limit.max(1)));
         let mut join_set = JoinSet::new();
 
         for candidate in candidates {
@@ -579,6 +838,9 @@ impl CrateSyncEngine {
                             source: Some(candidate.source.clone()),
                             candidate: Some(candidate.clone()),
                             message: error.to_string(),
+                            path: None,
+                            status_code: None,
+                            retryable: None,
                         });
                     }
                 };
@@ -594,6 +856,9 @@ impl CrateSyncEngine {
                     source: None,
                     candidate: None,
                     message: error.to_string(),
+                    path: None,
+                    status_code: None,
+                    retryable: None,
                 })),
             }
         }
@@ -630,17 +895,24 @@ async fn resolve_candidate(
 ) -> CandidateResolution {
     if let Some(track_id) = candidate.beatport_track_id {
         return CandidateResolution::Matched(SyncResolvedCandidate {
-            matched_track: SyncTrackSummary {
-                id: track_id,
-                artist: candidate.artist.clone(),
-                track: candidate.track.clone(),
-                mix: candidate.mix.clone(),
+            matched_track: CompactTrackSummary {
+                track_id,
+                playlist_track_id: None,
+                artist_names: split_artists(&candidate.artist),
+                track_name: candidate.track.clone(),
+                mix_name: candidate.mix.clone(),
+                isrc: None,
+                label_track_identifier: None,
                 genre: candidate.genre.clone(),
-                url: None,
+                length_ms: None,
+                bpm: None,
+                release_name: None,
                 publish_date: None,
+                url: None,
             },
             candidate,
             confidence_score: 100.0,
+            duplicate_basis: None,
         });
     }
 
@@ -656,19 +928,21 @@ async fn resolve_candidate(
         Ok(response) => match serde_json::from_value(response.data) {
             Ok(search) => search,
             Err(error) => {
-                return CandidateResolution::Failure(SyncFailure {
-                    source: Some(candidate.source.clone()),
-                    candidate: Some(candidate),
-                    message: error.to_string(),
-                });
+                return CandidateResolution::Failure(sync_failure_from_error(
+                    Some(candidate.source.clone()),
+                    Some(candidate),
+                    error.into(),
+                    Some("/v4/catalog/search/".into()),
+                ));
             }
         },
         Err(error) => {
-            return CandidateResolution::Failure(SyncFailure {
-                source: Some(candidate.source.clone()),
-                candidate: Some(candidate),
-                message: error.to_string(),
-            });
+            return CandidateResolution::Failure(sync_failure_from_error(
+                Some(candidate.source.clone()),
+                Some(candidate),
+                error,
+                Some("/v4/catalog/search/".into()),
+            ));
         }
     };
 
@@ -693,7 +967,16 @@ async fn resolve_candidate(
         });
     }
 
-    let best = &scored[0];
+    let mut collapsed = Vec::new();
+    let mut seen_identities = BTreeSet::new();
+    for scored_match in scored {
+        let identity_key = recording_identity(&scored_match.summary).primary_key();
+        if seen_identities.insert(identity_key) {
+            collapsed.push(scored_match);
+        }
+    }
+
+    let best = &collapsed[0];
     if !best.accepts(matching_policy) {
         return CandidateResolution::NotFound(SyncNotFoundCandidate {
             candidate,
@@ -702,9 +985,9 @@ async fn resolve_candidate(
         });
     }
 
-    let near_matches = scored
+    let near_matches = collapsed
         .iter()
-        .take(3)
+        .take(5)
         .filter(|candidate_score| {
             best.score - candidate_score.score <= matching_policy.ambiguity_gap()
         })
@@ -721,6 +1004,7 @@ async fn resolve_candidate(
         candidate,
         matched_track: best.summary.clone(),
         confidence_score: best.score,
+        duplicate_basis: None,
     })
 }
 
@@ -789,8 +1073,11 @@ fn normalize_candidate(candidate: SyncCandidate) -> Result<SyncCandidate> {
         track,
         mix: trim_optional(candidate.mix),
         genre: trim_optional(candidate.genre),
-        source,
+        source: source.clone(),
+        source_type: trim_optional(candidate.source_type),
+        source_name: trim_optional(candidate.source_name).or_else(|| Some(source.clone())),
         source_url: trim_optional(candidate.source_url),
+        discovered_at: trim_optional(candidate.discovered_at),
         beatport_track_id: candidate.beatport_track_id,
     })
 }
@@ -854,6 +1141,10 @@ fn normalize_artist_list(text: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn split_artists(text: &str) -> Vec<String> {
+    normalize_artist_list(text)
 }
 
 fn token_overlap(left: &str, right: &str) -> usize {
@@ -956,8 +1247,16 @@ fn score_candidate_match(candidate: &SyncCandidate, track: ApiTrack) -> ScoredMa
         score += 0.5;
     }
 
+    if let Some(candidate_mix) = candidate.mix.as_ref().map(|mix| normalize_text(mix)) {
+        if candidate_mix.contains("extended") {
+            if track_mix.contains("extended") || track_mix.contains("club") {
+                score += 4.0;
+            }
+        }
+    }
+
     ScoredMatch {
-        summary: track_summary_from_track(&track),
+        summary: compact_track_summary_from_api_track(&track, None),
         score,
         title_signal,
         artist_signal,
@@ -975,7 +1274,10 @@ fn candidate_from_chart_track(
         mix: track.mix_name.clone(),
         genre: track.genre.as_ref().map(|item| item.name.clone()),
         source: genre_source_key(genre),
+        source_type: Some("beatport_chart".into()),
+        source_name: chart.name.clone().or_else(|| Some(genre.name.clone())),
         source_url: chart.url.clone(),
+        discovered_at: Some(Utc::now().to_rfc3339()),
         beatport_track_id: Some(track.id),
     }
 }
@@ -990,27 +1292,60 @@ fn genre_source_key(genre: &ApiGenreEntry) -> String {
     )
 }
 
-fn track_summary_from_track(track: &ApiTrack) -> SyncTrackSummary {
-    SyncTrackSummary {
-        id: track.id,
-        artist: join_artist_names(&track.artists),
-        track: track.name.clone(),
-        mix: track.mix_name.clone(),
-        genre: track.genre.as_ref().map(|genre| genre.name.clone()),
-        url: track.url.clone(),
-        publish_date: track
-            .new_release_date
-            .clone()
-            .or_else(|| track.publish_date.clone()),
-    }
-}
-
 fn join_artist_names(artists: &[ApiArtist]) -> String {
     artists
         .iter()
         .map(|artist| artist.name.clone())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn compact_track_summary_from_api_track(
+    track: &ApiTrack,
+    playlist_track_id: Option<u64>,
+) -> CompactTrackSummary {
+    CompactTrackSummary {
+        track_id: track.id,
+        playlist_track_id,
+        artist_names: track
+            .artists
+            .iter()
+            .map(|artist| artist.name.clone())
+            .collect(),
+        track_name: track.name.clone(),
+        mix_name: track.mix_name.clone(),
+        isrc: track.isrc.clone(),
+        label_track_identifier: track.label_track_identifier.clone(),
+        genre: track.genre.as_ref().map(|genre| genre.name.clone()),
+        length_ms: track
+            .length_ms
+            .or_else(|| parse_length_to_ms(track.length.as_ref())),
+        bpm: track.bpm,
+        release_name: track.release.as_ref().map(|release| release.name.clone()),
+        publish_date: track
+            .new_release_date
+            .clone()
+            .or_else(|| track.publish_date.clone()),
+        url: track.url.clone(),
+    }
+}
+
+fn parse_length_to_ms(length: Option<&Value>) -> Option<u64> {
+    match length {
+        Some(Value::Number(number)) => number.as_u64().map(|seconds| seconds * 1000),
+        Some(Value::String(text)) => {
+            let parts = text
+                .split(':')
+                .filter_map(|part| part.parse::<u64>().ok())
+                .collect::<Vec<_>>();
+            match parts.as_slice() {
+                [minutes, seconds] => Some((minutes * 60 + seconds) * 1000),
+                [hours, minutes, seconds] => Some((hours * 3600 + minutes * 60 + seconds) * 1000),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn chart_is_recent(chart: &ApiChart, cutoff: DateTime<Utc>) -> bool {
@@ -1060,9 +1395,263 @@ fn new_plan_id() -> String {
     )
 }
 
+fn build_summary(
+    addable: usize,
+    already_present: usize,
+    already_seen: usize,
+    ambiguous: usize,
+    not_found: usize,
+    failures: usize,
+    remaining_review: usize,
+) -> PlaylistSyncDryRunSummary {
+    PlaylistSyncDryRunSummary {
+        addable,
+        already_present,
+        already_seen,
+        ambiguous,
+        not_found,
+        failures,
+        remaining_review,
+    }
+}
+
+fn build_review_items(
+    ambiguous: &[SyncAmbiguousCandidate],
+    not_found: &[SyncNotFoundCandidate],
+) -> Vec<SyncReviewItem> {
+    let mut out = Vec::new();
+    for item in ambiguous {
+        out.push(SyncReviewItem {
+            review_index: out.len() + 1,
+            candidate: item.candidate.clone(),
+            status: ReviewStatus::Ambiguous,
+            options: item.matches.iter().take(5).cloned().collect(),
+            reason: None,
+        });
+    }
+    for item in not_found {
+        let mut options = Vec::new();
+        if let Some(best_match) = item.best_match.clone() {
+            options.push(best_match);
+        }
+        out.push(SyncReviewItem {
+            review_index: out.len() + 1,
+            candidate: item.candidate.clone(),
+            status: ReviewStatus::NotFound,
+            options,
+            reason: Some(item.reason.clone()),
+        });
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+struct RecordingIdentity {
+    track_id: u64,
+    isrc: Option<String>,
+    label_track_identifier: Option<String>,
+    artist_title_mix: String,
+    artist_title: String,
+    length_ms: Option<u64>,
+    bpm: Option<u64>,
+}
+
+impl RecordingIdentity {
+    fn primary_key(&self) -> String {
+        if let Some(isrc) = self.isrc.as_ref() {
+            return format!("isrc:{isrc}");
+        }
+        if let Some(label) = self.label_track_identifier.as_ref() {
+            return format!("label:{label}");
+        }
+        format!("mix:{}", self.artist_title_mix)
+    }
+
+    fn storage_keys(&self) -> Vec<String> {
+        let mut keys = vec![
+            format!("track:{}", self.track_id),
+            format!("mix:{}", self.artist_title_mix),
+        ];
+        keys.push(format!("title:{}", self.artist_title));
+        if let Some(isrc) = self.isrc.as_ref() {
+            keys.push(format!("isrc:{isrc}"));
+        }
+        if let Some(label) = self.label_track_identifier.as_ref() {
+            keys.push(format!("label:{label}"));
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+}
+
+fn recording_identity(summary: &CompactTrackSummary) -> RecordingIdentity {
+    let artists = if summary.artist_names.is_empty() {
+        String::new()
+    } else {
+        summary.artist_names.join(" ")
+    };
+    let artist_title = format!(
+        "{}|{}",
+        normalize_text(&artists),
+        normalize_title(&summary.track_name)
+    );
+    let artist_title_mix = format!(
+        "{}|{}",
+        artist_title,
+        summary
+            .mix_name
+            .as_deref()
+            .map(normalize_text)
+            .unwrap_or_default()
+    );
+    RecordingIdentity {
+        track_id: summary.track_id,
+        isrc: summary.isrc.as_deref().map(normalize_text),
+        label_track_identifier: summary
+            .label_track_identifier
+            .as_deref()
+            .map(normalize_text),
+        artist_title_mix,
+        artist_title,
+        length_ms: summary.length_ms,
+        bpm: summary.bpm,
+    }
+}
+
+fn duplicate_basis_from_seen(
+    seen: Option<&BTreeSet<String>>,
+    identity: &RecordingIdentity,
+    track_id: u64,
+) -> Option<SyncDuplicateBasis> {
+    let seen = seen?;
+    if seen.contains(&format!("track:{track_id}")) {
+        return Some(SyncDuplicateBasis {
+            kind: DuplicateBasisKind::ExactTrackId,
+            matched_track_id: Some(track_id),
+            detail: "matched previously seen exact Beatport track id".into(),
+        });
+    }
+    if let Some(isrc) = identity.isrc.as_ref()
+        && seen.contains(&format!("isrc:{isrc}"))
+    {
+        return Some(SyncDuplicateBasis {
+            kind: DuplicateBasisKind::Isrc,
+            matched_track_id: None,
+            detail: format!("matched previously seen ISRC `{isrc}`"),
+        });
+    }
+    if let Some(label) = identity.label_track_identifier.as_ref()
+        && seen.contains(&format!("label:{label}"))
+    {
+        return Some(SyncDuplicateBasis {
+            kind: DuplicateBasisKind::LabelTrackIdentifier,
+            matched_track_id: None,
+            detail: format!("matched previously seen label track identifier `{label}`"),
+        });
+    }
+    if seen.contains(&format!("mix:{}", identity.artist_title_mix)) {
+        return Some(SyncDuplicateBasis {
+            kind: DuplicateBasisKind::NormalizedArtistTitleMix,
+            matched_track_id: None,
+            detail: "matched previously seen normalized artist/title/mix".into(),
+        });
+    }
+    if seen.contains(&format!("title:{}", identity.artist_title)) {
+        return Some(SyncDuplicateBasis {
+            kind: DuplicateBasisKind::NormalizedArtistTitleHeuristic,
+            matched_track_id: None,
+            detail: "matched previously seen normalized artist/title".into(),
+        });
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+struct PlaylistIdentityIndex {
+    tracks: Vec<CompactTrackSummary>,
+}
+
+impl PlaylistIdentityIndex {
+    fn from_tracks(tracks: &[CompactTrackSummary]) -> Self {
+        Self {
+            tracks: tracks.to_vec(),
+        }
+    }
+
+    fn duplicate_basis_for(&self, candidate: &CompactTrackSummary) -> Option<SyncDuplicateBasis> {
+        let candidate_identity = recording_identity(candidate);
+        for track in &self.tracks {
+            let identity = recording_identity(track);
+            if track.track_id == candidate.track_id {
+                return Some(SyncDuplicateBasis {
+                    kind: DuplicateBasisKind::ExactTrackId,
+                    matched_track_id: Some(track.track_id),
+                    detail: "matched exact Beatport track id already in playlist".into(),
+                });
+            }
+            if let (Some(left), Some(right)) =
+                (candidate_identity.isrc.as_ref(), identity.isrc.as_ref())
+                && left == right
+            {
+                return Some(SyncDuplicateBasis {
+                    kind: DuplicateBasisKind::Isrc,
+                    matched_track_id: Some(track.track_id),
+                    detail: format!("matched existing playlist track by ISRC `{left}`"),
+                });
+            }
+            if let (Some(left), Some(right)) = (
+                candidate_identity.label_track_identifier.as_ref(),
+                identity.label_track_identifier.as_ref(),
+            ) && left == right
+            {
+                return Some(SyncDuplicateBasis {
+                    kind: DuplicateBasisKind::LabelTrackIdentifier,
+                    matched_track_id: Some(track.track_id),
+                    detail: format!(
+                        "matched existing playlist track by label track identifier `{left}`"
+                    ),
+                });
+            }
+            if candidate_identity.artist_title_mix == identity.artist_title_mix {
+                return Some(SyncDuplicateBasis {
+                    kind: DuplicateBasisKind::NormalizedArtistTitleMix,
+                    matched_track_id: Some(track.track_id),
+                    detail: "matched existing playlist track by normalized artist/title/mix".into(),
+                });
+            }
+            if candidate_identity.artist_title == identity.artist_title
+                && close_length(candidate_identity.length_ms, identity.length_ms)
+                && close_bpm(candidate_identity.bpm, identity.bpm)
+            {
+                return Some(SyncDuplicateBasis {
+                    kind: DuplicateBasisKind::NormalizedArtistTitleHeuristic,
+                    matched_track_id: Some(track.track_id),
+                    detail: "matched existing playlist track by normalized artist/title with similar duration/BPM".into(),
+                });
+            }
+        }
+        None
+    }
+}
+
+fn close_length(left: Option<u64>, right: Option<u64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.abs_diff(right) <= DUPLICATE_LENGTH_WINDOW_MS,
+        _ => true,
+    }
+}
+
+fn close_bpm(left: Option<u64>, right: Option<u64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.abs_diff(right) <= 1,
+        _ => true,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ScoredMatch {
-    summary: SyncTrackSummary,
+    summary: CompactTrackSummary,
     score: f64,
     title_signal: bool,
     artist_signal: bool,
@@ -1097,31 +1686,33 @@ impl SyncStateStore {
     async fn record_dry_run(
         &self,
         output: PlaylistSyncDryRunOutput,
-        seen_updates: Vec<(String, u64)>,
+        seen_updates: Vec<(String, Vec<String>)>,
     ) -> Result<()> {
         let mut guard = self.cache.lock().await;
         self.ensure_loaded(&mut guard).await?;
         let state = guard.as_mut().expect("state should be loaded");
-        for (key, track_id) in seen_updates {
-            state.seen.entry(key).or_default().insert(track_id);
+        for (key, identities) in seen_updates {
+            let bucket = state.seen.entry(key).or_default();
+            for identity in identities {
+                bucket.insert(identity);
+            }
         }
-        state.plans.insert(
-            output.plan_id.clone(),
-            StoredSyncPlan {
-                plan_id: output.plan_id.clone(),
-                playlist_id: output.playlist_id,
-                created_at: Utc::now().to_rfc3339(),
-                matching_policy: output.matching_policy,
-                dedupe_policy: output.dedupe_policy,
-                addable: output.addable,
-                already_present: output.already_present,
-                already_seen: output.already_seen,
-                ambiguous: output.ambiguous,
-                not_found: output.not_found,
-                failures: output.failures,
-                last_apply: None,
-            },
-        );
+        state
+            .plans
+            .insert(output.plan_id.clone(), StoredSyncPlan::from_output(output));
+        self.persist(state).await
+    }
+
+    async fn record_seen_updates(&self, seen_updates: Vec<(String, Vec<String>)>) -> Result<()> {
+        let mut guard = self.cache.lock().await;
+        self.ensure_loaded(&mut guard).await?;
+        let state = guard.as_mut().expect("state should be loaded");
+        for (key, identities) in seen_updates {
+            let bucket = state.seen.entry(key).or_default();
+            for identity in identities {
+                bucket.insert(identity);
+            }
+        }
         self.persist(state).await
     }
 
@@ -1133,26 +1724,11 @@ impl SyncStateStore {
             .and_then(|state| state.plans.get(plan_id).cloned()))
     }
 
-    async fn record_apply(
-        &self,
-        plan_id: &str,
-        output: &PlaylistSyncApplyOutput,
-        applied_at: String,
-    ) -> Result<()> {
+    async fn save_plan(&self, plan: StoredSyncPlan) -> Result<()> {
         let mut guard = self.cache.lock().await;
         self.ensure_loaded(&mut guard).await?;
         let state = guard.as_mut().expect("state should be loaded");
-        let Some(plan) = state.plans.get_mut(plan_id) else {
-            return Err(AppError::InvalidConfig(format!(
-                "unknown plan_id `{plan_id}`"
-            )));
-        };
-        plan.last_apply = Some(StoredApplySummary {
-            applied_at,
-            added_track_ids: output.added_track_ids.clone(),
-            skipped_track_ids: output.skipped_track_ids.clone(),
-            failures: output.failures.clone(),
-        });
+        state.plans.insert(plan.plan_id.clone(), plan);
         self.persist(state).await
     }
 
@@ -1183,18 +1759,25 @@ impl SyncStateStore {
 #[serde(default)]
 struct SyncStateFile {
     version: u8,
-    seen: BTreeMap<String, BTreeSet<u64>>,
+    seen: BTreeMap<String, BTreeSet<String>>,
     plans: BTreeMap<String, StoredSyncPlan>,
 }
 
 impl Default for SyncStateFile {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             seen: BTreeMap::new(),
             plans: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredReviewItem {
+    review: SyncReviewItem,
+    resolved: bool,
+    skipped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1209,16 +1792,69 @@ struct StoredSyncPlan {
     already_seen: Vec<SyncResolvedCandidate>,
     ambiguous: Vec<SyncAmbiguousCandidate>,
     not_found: Vec<SyncNotFoundCandidate>,
+    review_items: Vec<StoredReviewItem>,
     failures: Vec<SyncFailure>,
     last_apply: Option<StoredApplySummary>,
+}
+
+impl StoredSyncPlan {
+    fn from_output(output: PlaylistSyncDryRunOutput) -> Self {
+        Self {
+            plan_id: output.plan_id,
+            playlist_id: output.playlist_id,
+            created_at: Utc::now().to_rfc3339(),
+            matching_policy: output.matching_policy,
+            dedupe_policy: output.dedupe_policy,
+            addable: output.addable,
+            already_present: output.already_present,
+            already_seen: output.already_seen,
+            ambiguous: output.ambiguous,
+            not_found: output.not_found,
+            review_items: output
+                .review_items
+                .into_iter()
+                .map(|review| StoredReviewItem {
+                    review,
+                    resolved: false,
+                    skipped: false,
+                })
+                .collect(),
+            failures: output.failures,
+            last_apply: None,
+        }
+    }
+
+    fn pending_review_items(&self) -> Vec<SyncReviewItem> {
+        self.review_items
+            .iter()
+            .filter(|item| !item.resolved)
+            .map(|item| item.review.clone())
+            .collect()
+    }
+
+    fn summary(&self) -> PlaylistSyncDryRunSummary {
+        build_summary(
+            self.addable.len(),
+            self.already_present.len(),
+            self.already_seen.len(),
+            self.ambiguous.len(),
+            self.not_found.len(),
+            self.failures.len(),
+            self.review_items
+                .iter()
+                .filter(|item| !item.resolved)
+                .count(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredApplySummary {
     applied_at: String,
-    added_track_ids: Vec<u64>,
-    skipped_track_ids: Vec<u64>,
-    failures: Vec<SyncApplyFailure>,
+    added: Vec<CompactTrackSummary>,
+    skipped_already_present: Vec<CompactTrackSummary>,
+    skipped_seen: Vec<CompactTrackSummary>,
+    failed: Vec<SyncApplyFailure>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1234,6 +1870,7 @@ struct ApiSearchResults {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ApiPlaylistTrackEntry {
+    id: u64,
     tombstoned: Option<bool>,
     track: ApiTrack,
 }
@@ -1241,6 +1878,7 @@ struct ApiPlaylistTrackEntry {
 #[derive(Debug, Clone, Deserialize)]
 struct ApiChart {
     id: u64,
+    name: Option<String>,
     url: Option<String>,
     publish_date: Option<String>,
 }
@@ -1259,10 +1897,16 @@ struct ApiTrack {
     mix_name: Option<String>,
     genre: Option<ApiGenre>,
     artists: Vec<ApiArtist>,
+    release: Option<ApiRelease>,
     url: Option<String>,
     publish_date: Option<String>,
     new_release_date: Option<String>,
     is_available_for_streaming: Option<bool>,
+    isrc: Option<String>,
+    label_track_identifier: Option<String>,
+    length_ms: Option<u64>,
+    length: Option<Value>,
+    bpm: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1271,8 +1915,77 @@ struct ApiGenre {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct ApiRelease {
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct ApiArtist {
     name: String,
+}
+
+fn sync_failure_from_error(
+    source: Option<String>,
+    candidate: Option<SyncCandidate>,
+    error: AppError,
+    path: Option<String>,
+) -> SyncFailure {
+    match error {
+        AppError::BeatportApi {
+            status, message, ..
+        } => SyncFailure {
+            source,
+            candidate,
+            message,
+            path,
+            status_code: Some(status),
+            retryable: Some(status == 429 || status >= 500),
+        },
+        AppError::Http(error) => SyncFailure {
+            source,
+            candidate,
+            message: error.to_string(),
+            path,
+            status_code: None,
+            retryable: Some(error.is_timeout() || error.is_connect() || error.is_request()),
+        },
+        other => SyncFailure {
+            source,
+            candidate,
+            message: other.to_string(),
+            path,
+            status_code: None,
+            retryable: None,
+        },
+    }
+}
+
+fn apply_failure_from_error(track_ids: Vec<u64>, error: AppError) -> SyncApplyFailure {
+    match error {
+        AppError::BeatportApi {
+            status, message, ..
+        } => SyncApplyFailure {
+            track_ids,
+            message,
+            path: None,
+            status_code: Some(status),
+            retryable: Some(status == 429 || status >= 500),
+        },
+        AppError::Http(error) => SyncApplyFailure {
+            track_ids,
+            message: error.to_string(),
+            path: None,
+            status_code: None,
+            retryable: Some(error.is_timeout() || error.is_connect() || error.is_request()),
+        },
+        other => SyncApplyFailure {
+            track_ids,
+            message: other.to_string(),
+            path: None,
+            status_code: None,
+            retryable: None,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1288,7 +2001,10 @@ mod tests {
             mix: Some("Extended Mix".into()),
             genre: Some("Tech House".into()),
             source: "beatport_charts:tech-house".into(),
+            source_type: Some("beatport_chart".into()),
+            source_name: Some("Tech House Top 10".into()),
             source_url: None,
+            discovered_at: None,
             beatport_track_id: None,
         }
     }
@@ -1302,10 +2018,18 @@ mod tests {
             artists: vec![ApiArtist {
                 name: artist.into(),
             }],
+            release: Some(ApiRelease {
+                name: "Release".into(),
+            }),
             url: Some(format!("https://example.com/tracks/{id}")),
             publish_date: Some("2026-03-28".into()),
             new_release_date: Some("2026-03-28".into()),
             is_available_for_streaming: Some(true),
+            isrc: Some(format!("ISRC{id}")),
+            label_track_identifier: Some(format!("LBL-{id}")),
+            length_ms: Some(367_000),
+            length: None,
+            bpm: Some(128),
         }
     }
 
@@ -1368,6 +2092,26 @@ mod tests {
         assert_eq!(deduped.len(), 1);
     }
 
+    #[test]
+    fn semantic_duplicate_prefers_isrc_before_heuristics() {
+        let existing = compact_track_summary_from_api_track(
+            &track(
+                1,
+                "Mau P",
+                "The Less I Know The Better",
+                "Original Mix",
+                "Tech House",
+            ),
+            Some(10),
+        );
+        let mut incoming = existing.clone();
+        incoming.track_id = 99;
+        let basis = PlaylistIdentityIndex::from_tracks(&[existing])
+            .duplicate_basis_for(&incoming)
+            .expect("duplicate basis should exist");
+        assert_eq!(basis.kind, DuplicateBasisKind::Isrc);
+    }
+
     #[tokio::test]
     async fn state_store_persists_seen_tracks_and_plans() {
         let dir = tempdir().expect("tempdir should exist");
@@ -1377,23 +2121,32 @@ mod tests {
             playlist_id: 42,
             matching_policy: SyncMatchingPolicy::Conservative,
             dedupe_policy: SyncDedupePolicy::PlaylistAndSeen,
+            summary: build_summary(1, 0, 0, 0, 0, 0, 0),
             addable: vec![SyncResolvedCandidate {
                 candidate: candidate(),
-                matched_track: SyncTrackSummary {
-                    id: 100,
-                    artist: "Mau P".into(),
-                    track: "The Less I Know The Better".into(),
-                    mix: Some("Extended Mix".into()),
+                matched_track: CompactTrackSummary {
+                    track_id: 100,
+                    playlist_track_id: None,
+                    artist_names: vec!["Mau P".into()],
+                    track_name: "The Less I Know The Better".into(),
+                    mix_name: Some("Extended Mix".into()),
+                    isrc: Some("ABC123".into()),
+                    label_track_identifier: Some("LBL-100".into()),
                     genre: Some("Tech House".into()),
+                    length_ms: Some(367_000),
+                    bpm: Some(128),
+                    release_name: Some("Release".into()),
                     url: None,
                     publish_date: None,
                 },
                 confidence_score: 99.0,
+                duplicate_basis: None,
             }],
             already_present: Vec::new(),
             already_seen: Vec::new(),
             ambiguous: Vec::new(),
             not_found: Vec::new(),
+            review_items: Vec::new(),
             failures: Vec::new(),
         };
         store
@@ -1401,20 +2154,19 @@ mod tests {
                 output.clone(),
                 vec![(
                     seen_bucket_key(42, &output.addable[0].candidate.source),
-                    100,
+                    recording_identity(&output.addable[0].matched_track).storage_keys(),
                 )],
             )
             .await
             .expect("dry run should persist");
 
         let snapshot = store.snapshot().await.expect("snapshot should load");
-        assert_eq!(
+        assert!(
             snapshot
                 .seen
                 .get(&seen_bucket_key(42, &output.addable[0].candidate.source))
                 .expect("seen bucket should exist")
-                .contains(&100),
-            true
+                .contains("track:100")
         );
         assert!(snapshot.plans.contains_key("plan-1"));
     }

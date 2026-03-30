@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::{
     auth::{AuthManager, ConnectResult, DisconnectResult, TokenSet},
-    config::Config,
+    config::{AuthMode, Config},
     error::{AppError, Result},
 };
 
@@ -47,6 +47,23 @@ pub struct SearchResults {
     pub charts: Option<Value>,
     pub labels: Option<Value>,
     pub playlists: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CompactTrackSummary {
+    pub track_id: u64,
+    pub playlist_track_id: Option<u64>,
+    pub artist_names: Vec<String>,
+    pub track_name: String,
+    pub mix_name: Option<String>,
+    pub isrc: Option<String>,
+    pub label_track_identifier: Option<String>,
+    pub genre: Option<String>,
+    pub length_ms: Option<u64>,
+    pub bpm: Option<u64>,
+    pub release_name: Option<String>,
+    pub publish_date: Option<String>,
+    pub url: Option<String>,
 }
 
 impl SearchResults {
@@ -131,6 +148,14 @@ impl BeatportClient {
 
     pub fn sync_state_path_string(&self) -> String {
         self.config.sync_state_path_string()
+    }
+
+    pub fn sync_search_concurrency(&self) -> usize {
+        self.config.sync_search_concurrency
+    }
+
+    pub fn auth_mode(&self) -> AuthMode {
+        self.config.auth_mode
     }
 
     pub async fn snapshot_token(&self) -> Option<TokenSet> {
@@ -325,7 +350,110 @@ fn retry_delay_for_attempt(
         1 => 2,
         _ => 4,
     };
-    Duration::from_secs(seconds)
+    let jitter_ms = rand::random::<u64>() % 250;
+    Duration::from_secs(seconds) + Duration::from_millis(jitter_ms)
+}
+
+pub fn extract_compact_track_summaries(value: &Value) -> Result<Vec<CompactTrackSummary>> {
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| value.as_array().cloned())
+        .unwrap_or_default();
+    Ok(results
+        .iter()
+        .filter_map(compact_track_summary_from_entry)
+        .collect())
+}
+
+fn compact_track_summary_from_entry(value: &Value) -> Option<CompactTrackSummary> {
+    let playlist_track_id = value.get("id").and_then(Value::as_u64);
+    let track_value = value.get("track").unwrap_or(value);
+    compact_track_summary_from_track(track_value, playlist_track_id)
+}
+
+fn compact_track_summary_from_track(
+    value: &Value,
+    playlist_track_id: Option<u64>,
+) -> Option<CompactTrackSummary> {
+    let track_id = value.get("id").and_then(Value::as_u64)?;
+    Some(CompactTrackSummary {
+        track_id,
+        playlist_track_id,
+        artist_names: value
+            .get("artists")
+            .and_then(Value::as_array)
+            .map(|artists| {
+                artists
+                    .iter()
+                    .filter_map(|artist| artist.get("name").and_then(Value::as_str))
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        track_name: value.get("name").and_then(Value::as_str)?.to_string(),
+        mix_name: value
+            .get("mix_name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        isrc: value
+            .get("isrc")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        label_track_identifier: value
+            .get("label_track_identifier")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        genre: value
+            .get("genre")
+            .and_then(|genre| {
+                genre
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| genre.as_str())
+            })
+            .map(ToOwned::to_owned),
+        length_ms: extract_length_ms(value),
+        bpm: value.get("bpm").and_then(Value::as_u64),
+        release_name: value
+            .get("release")
+            .and_then(|release| {
+                release
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| release.as_str())
+            })
+            .map(ToOwned::to_owned),
+        publish_date: value
+            .get("new_release_date")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("publish_date").and_then(Value::as_str))
+            .map(ToOwned::to_owned),
+        url: value
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn extract_length_ms(value: &Value) -> Option<u64> {
+    if let Some(ms) = value.get("length_ms").and_then(Value::as_u64) {
+        return Some(ms);
+    }
+    if let Some(seconds) = value.get("length").and_then(Value::as_u64) {
+        return Some(seconds * 1000);
+    }
+    let raw = value.get("length").and_then(Value::as_str)?;
+    let parts = raw
+        .split(':')
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [minutes, seconds] => Some((minutes * 60 + seconds) * 1000),
+        [hours, minutes, seconds] => Some((hours * 3600 + minutes * 60 + seconds) * 1000),
+        _ => None,
+    }
 }
 
 fn build_api_url(path: &str, query: Option<&BTreeMap<String, Value>>) -> Result<Url> {
